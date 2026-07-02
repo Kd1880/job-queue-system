@@ -1,0 +1,185 @@
+# docker-compose.yml
+# ------------------
+# PURPOSE: Boots the entire job queue system with a single command:
+#   docker-compose up
+#
+# Four services, wired together on Docker's default bridge network so they
+# can reach each other by service name (e.g. the api container connects to
+# Postgres at host "postgres", not "localhost" or an IP address):
+#   1. postgres - permanent storage for job records (source of truth)
+#   2. redis    - fast in-memory queue, hands jobs off to the worker
+#   3. api      - FastAPI HTTP server, accepts job submissions
+#   4. worker   - background process, pulls jobs from Redis and executes them
+#
+# WHY DOCKER COMPOSE (instead of running each piece manually): it captures
+# the full topology (which service needs which, in what order, with what
+# env vars) as code. A new contributor clones the repo and runs one command
+# instead of manually installing Postgres, Redis, and two Python
+# environments.
+
+services:
+  # --------------------------------------------------------------------------
+  # POSTGRES: permanent storage for job state.
+  # --------------------------------------------------------------------------
+  postgres:
+    # PostgreSQL 15 Alpine = lightweight version of Postgres.
+    # Alpine Linux base = much smaller Docker image (~80MB vs ~380MB for the
+    # default debian-based image), which means faster `docker-compose up`
+    # on a clean machine (less to download).
+    image: postgres:15-alpine
+
+    container_name: jobqueue_postgres
+
+    # These credentials are only for local development. They match the
+    # values baked into DATABASE_URL in .env. In production (e.g. AWS RDS),
+    # never use default/hardcoded credentials — use a secrets manager.
+    environment:
+      POSTGRES_DB: jobqueue
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+
+    ports:
+      # host:container — exposes Postgres on localhost:5432 so you can
+      # connect with psql/DBeaver from the host machine for debugging,
+      # even though api/worker reach it via the internal "postgres" hostname.
+      - "5432:5432"
+
+    volumes:
+      # Named volume persists database files across `docker-compose down` /
+      # `up` cycles (but NOT across `docker-compose down -v`, which deletes
+      # volumes). Without this, all job history would vanish every restart.
+      - postgres_data:/var/lib/postgresql/data
+
+      # Mount our SQL migration file into Postgres's init directory.
+      # Postgres automatically runs every .sql file in this folder, in
+      # filename order, but ONLY the very first time the data volume is
+      # initialized (i.e. on a clean checkout with no existing volume).
+      # This creates our tables/indexes with zero manual setup.
+      - ./migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql
+
+    # Healthcheck lets other services (api, worker) wait for Postgres to be
+    # ready to accept connections, not just for the container to have
+    # started (those are different things — Postgres takes a moment after
+    # container start to finish initializing on a fresh volume).
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d jobqueue"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # --------------------------------------------------------------------------
+  # REDIS: the fast in-memory queue that hands jobs off to the worker.
+  # --------------------------------------------------------------------------
+  redis:
+    # Redis 7 Alpine, same reasoning as Postgres Alpine above: small image,
+    # fast pulls, nothing we don't need (no persistence config required
+    # since Redis here is a transient queue, not a database — if Redis
+    # restarts and loses queued jobs, Postgres still has every job recorded
+    # as 'pending' and could be manually re-queued; that reconciliation
+    # logic is out of scope for Phase 1).
+    image: redis:7-alpine
+
+    container_name: jobqueue_redis
+
+    ports:
+      # Exposes Redis on localhost:6379 for local debugging with redis-cli.
+      - "6379:6379"
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # --------------------------------------------------------------------------
+  # API: FastAPI HTTP server. Accepts job submissions, serves job status.
+  # --------------------------------------------------------------------------
+  api:
+    build:
+      # Build context = ./api, so the Dockerfile there only has access to
+      # api/ source files by default. We still need requirements.txt
+      # (at the repo root) inside the image — handled by copying it in via
+      # a build context override below.
+      context: .
+      dockerfile: api/Dockerfile
+
+    container_name: jobqueue_api
+
+    ports:
+      - "8000:8000"
+
+    # depends_on with condition: service_healthy means Docker Compose won't
+    # even START the api container until both postgres and redis report
+    # healthy (per their healthchecks above). This avoids a whole class of
+    # "connection refused on startup" race-condition bugs.
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+    # env_file loads every KEY=VALUE pair from .env into the container's
+    # environment. Both api and worker load the SAME file so they always
+    # agree on connection strings — one source of truth, no drift.
+    env_file:
+      - .env
+
+    volumes:
+      # Live-reload support: mount the local api/ source directory into the
+      # container so code edits on the host are immediately visible inside
+      # the container, letting `uvicorn --reload` pick up changes without
+      # rebuilding the image. Great for local development; you would NOT
+      # do this in a production image (which should be immutable).
+      - ./api:/app/api
+
+      # Worker and API share a filesystem for uploaded files / processed
+      # output (uploads/, processed/, resized/) since Phase 1 has no object
+      # storage (S3) yet — a real multi-machine deployment would need
+      # shared storage here instead of a local bind mount.
+      - ./uploads:/app/uploads
+      - ./processed:/app/processed
+      - ./resized:/app/resized
+
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app/api
+
+  # --------------------------------------------------------------------------
+  # WORKER: background process. BRPOPs jobs from Redis, executes them,
+  # writes results back to Postgres. Runs independently of the API process
+  # (a crash in the worker never takes down the HTTP server, and vice
+  # versa) — this separation is the core idea of a job queue architecture.
+  # --------------------------------------------------------------------------
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+
+    container_name: jobqueue_worker
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+    env_file:
+      - .env
+
+    volumes:
+      - ./worker:/app/worker
+      - ./uploads:/app/uploads
+      - ./processed:/app/processed
+      - ./resized:/app/resized
+
+    # restart: unless-stopped means Docker automatically restarts the
+    # worker process if it ever crashes (e.g. an unhandled exception that
+    # slipped past our try/except), UNLESS a human explicitly stopped it
+    # with `docker-compose stop`. This is what makes the worker resilient
+    # in a way a plain `python worker.py` run in a terminal is not.
+    restart: unless-stopped
+
+    command: python -m worker.worker
+
+# Named volumes declared at the top level, referenced by service definitions
+# above. Docker manages the actual storage location on the host.
+volumes:
+  postgres_data:

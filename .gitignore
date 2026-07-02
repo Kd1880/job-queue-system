@@ -1,0 +1,54 @@
+# .gitignore
+# ------------------
+# Keeps generated files, local environments, and OS/editor cruft out of the
+# repo so a clone contains only source — not build artifacts or machine-
+# specific junk.
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments (the throwaway .venv_check used for local test runs,
+# plus any standard venv names)
+.venv/
+.venv_check/
+venv/
+env/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- Runtime-generated job data ----
+# These directories are created/populated at runtime by the job handlers and
+# the seed script — they hold user uploads and processed output, not source.
+# We keep the folders in the repo (via .gitkeep below) but ignore their
+# contents so sample CSVs / resized images never get committed.
+uploads/*
+processed/*
+resized/*
+!uploads/.gitkeep
+!processed/.gitkeep
+!resized/.gitkeep
+
+# ---- Secrets / local config ----
+# The real .env stays local and is never committed; only .env.example (a
+# template with dummy defaults) is tracked. After cloning, run
+# `cp .env.example .env` before `docker-compose up` — see the README.
+.env
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~

@@ -1,0 +1,26 @@
+# requirements.txt
+# ------------------
+# PURPOSE: Single dependency list shared by both the api and worker Docker
+#          images. Keeping one file (instead of separate api/worker
+#          requirements) guarantees both containers use identical library
+#          versions, which avoids "works in api, breaks in worker" bugs
+#          caused by version drift (e.g. different pydantic major versions
+#          serializing JSON differently).
+
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+redis==5.0.4
+asyncpg==0.29.0
+pydantic==2.7.1
+pydantic-settings==2.2.1
+# Required by pydantic's EmailStr type (api/models.py::EmailPayload) —
+# EmailStr is a thin wrapper around this package, not bundled with
+# pydantic itself; omitting it causes an ImportError at import time.
+email-validator==2.1.1
+pandas==2.2.2
+Pillow==10.3.0
+python-multipart==0.0.9
+pytest==8.2.0
+pytest-asyncio==0.23.6
+httpx==0.27.0
+python-dotenv==1.0.1
