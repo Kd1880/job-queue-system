@@ -27,10 +27,6 @@ CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 -- lifecycle: pending -> running -> completed | failed.
 -- ============================================================================
 CREATE TABLE jobs (
-    -- Primary key. Generated server-side by Postgres by default, but in
-    -- practice the API generates the UUID itself (see api/routes/jobs.py)
-    -- so the SAME id can be used in the Redis payload and the Postgres row
-    -- from the very first write — no round trip needed to learn the id.
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
     -- Who submitted the job. Not a foreign key to a users table because
@@ -44,12 +40,6 @@ CREATE TABLE jobs (
     -- notoriously painful in Postgres) — validation instead happens in the
     -- Pydantic layer (api/models.py).
     type            VARCHAR(50) NOT NULL,
-
-    -- Arbitrary job-specific input, e.g. {"file_path": "uploads/data.csv"}.
-    -- JSONB (binary JSON) instead of JSON because JSONB is stored in a
-    -- parsed binary format — faster to query/index later, and de-duplicates
-    -- whitespace, at the small cost of slightly slower writes (irrelevant
-    -- here since jobs are written once).
     payload         JSONB NOT NULL,
 
     -- Current lifecycle state. Defaults to 'pending' because the row is
