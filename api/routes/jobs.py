@@ -26,6 +26,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from api.database import get_job, insert_job, list_jobs
+from api.middleware.rate_limiter import check_rate_limit
 from api.models import JobDetailResponse, JobListResponse, JobSubmitRequest, JobSubmitResponse
 from api.redis_client import push_job
 
@@ -74,7 +75,17 @@ def _record_to_job_detail(record: asyncpg.Record) -> JobDetailResponse:
     )
 
 
-@router.post("/jobs", response_model=JobSubmitResponse, status_code=201)
+# PHASE 2: check_rate_limit runs as a route-level dependency BEFORE this
+# handler (and before body validation): an over-limit user is rejected
+# with 429 at the cheapest possible point — no Postgres insert, no Redis
+# push, no payload validation spent on a request we're refusing. See
+# api/middleware/rate_limiter.py for the INCR+EXPIRE mechanics.
+@router.post(
+    "/jobs",
+    response_model=JobSubmitResponse,
+    status_code=201,
+    dependencies=[Depends(check_rate_limit)],
+)
 async def submit_job(
     request: JobSubmitRequest,
     pool: asyncpg.Pool = Depends(get_db_pool),

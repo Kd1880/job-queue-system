@@ -47,16 +47,17 @@ from worker.utils import (
     MAX_RETRIES,
     QUEUE_KEY,
     WORKER_TIMEOUT,
+    claim_job,
     create_db_pool,
     create_redis_client,
-    get_job,
     log_event,
+    mark_processing,
     move_to_dlq,
     requeue_job,
+    unmark_processing,
     update_job_completed,
     update_job_failed,
     update_job_retry,
-    update_job_running,
 )
 
 
@@ -111,29 +112,35 @@ async def process_job(job_data: dict, pool, redis_client) -> None:
     job_id = job_data["id"]
 
     # ------------------------------------------------------------------
-    # STEP 1: IDEMPOTENCY CHECK
-    # Fetch the job's current status from Postgres BEFORE doing any work.
-    # WHY: it's possible for a job_id to be seen twice by workers — e.g. a
-    # job was manually re-pushed to Redis, or (in Phase 2, with multiple
-    # worker replicas) two workers could theoretically pop the same
-    # message in a narrow race window. If the job is already 'completed'
-    # or already 'running' (started by another worker), skip it entirely
-    # rather than risk double-sending an email or double-processing a
-    # file — side-effecting operations must never run twice.
+    # STEP 1: ATOMIC CLAIM (Phase 2 — replaces the check-then-mark pair)
+    #
+    # Phase 1 did this in TWO steps: read the status, then (if it looked
+    # free) mark it running. With 3 workers that's a textbook race
+    # condition: two workers can both read 'pending' in the same
+    # millisecond and both execute the job — the recipient gets two
+    # emails. claim_job() collapses read+write into ONE Postgres
+    # transaction using SELECT ... FOR UPDATE SKIP LOCKED, so exactly one
+    # worker can ever win a given job; the loser gets False back in
+    # microseconds and simply moves on. It also subsumes Phase 1's
+    # idempotency check: an already-completed/running/failed job doesn't
+    # match WHERE status='pending', so duplicate deliveries through Redis
+    # are harmless no-ops. Full mechanics: worker/utils.py::claim_job.
     # ------------------------------------------------------------------
-    existing = await get_job(pool, job_id)
-    if existing is not None and existing["status"] in ("completed", "running"):
-        log_event("SKIPPED", job_id, extra=f"already {existing['status']}")
+    if not await claim_job(pool, job_id):
+        log_event("SKIPPED", job_id, extra="claim lost or job not pending")
         return
 
     # ------------------------------------------------------------------
-    # STEP 2: MARK RUNNING
-    # Write status='running' + started_at=now() to Postgres BEFORE
-    # executing. This is the checkpoint that makes "started but crashed"
-    # distinguishable from "never started" if the worker process dies
-    # mid-job (see worker/utils.py::update_job_running for more detail).
+    # STEP 2: ADD TO THE IN-FLIGHT LEDGER (Phase 2 — crash recovery)
+    # BRPOP already removed this job from the queue — from Redis's point
+    # of view it no longer exists anywhere. If this process dies before
+    # finishing, the job would be lost forever. SADD to jobs:processing
+    # records "a worker is holding this"; on startup, worker_pool.py's
+    # recover_stuck_jobs() requeues anything still in that set. The
+    # matching SREM lives in the `finally` below — EVERY exit path
+    # (success, retry, DLQ) clears the entry, so only a crash leaves it.
     # ------------------------------------------------------------------
-    await update_job_running(pool, job_id)
+    await mark_processing(redis_client, job_id)
     log_event("STARTED", job_id, extra=f"type={job_data['type']}")
 
     # ------------------------------------------------------------------
@@ -176,17 +183,26 @@ async def process_job(job_data: dict, pool, redis_client) -> None:
             # --------------------------------------------------------
             # RETRY PATH: exponential backoff, then re-queue.
             # --------------------------------------------------------
-            # Exponential backoff: 2^0=1s, 2^1=2s, 2^2=4s (+ up to 1s of
-            # random jitter each time). WHY exponential (not a fixed
-            # delay): if the failure is caused by a temporarily
-            # overloaded downstream system, retrying immediately would
-            # just hammer it again; backing off gives it time to recover,
-            # and growing the delay on each successive failure avoids
-            # piling on harder the more clearly something is actually
-            # broken. WHY random jitter: if many jobs failed at the same
-            # moment (e.g. Redis blipped), pure exponential backoff would
-            # have them ALL retry at the exact same instant again —
-            # jitter spreads retries out over time.
+            # Exponential backoff WITH JITTER: (2^retry_count) + random(0,1).
+            #
+            # WHY exponential (not a fixed delay): if the failure is a
+            # temporarily overloaded downstream system, retrying
+            # immediately just hammers it again; growing the delay on
+            # each successive failure (1s, 2s, 4s) gives it room to
+            # recover instead of piling on harder.
+            #
+            # WHY jitter — THE THUNDERING HERD PROBLEM: imagine Gmail
+            # blips for 2 seconds and 500 email jobs fail in the same
+            # instant. With PURE exponential backoff they all share the
+            # same schedule, so all 500 retry at exactly t+1s — a
+            # synchronized stampede that knocks the recovering service
+            # straight back over, fails together again, stampedes again
+            # at t+2s, forever. The failures stay perfectly correlated.
+            # Adding random.uniform(0, 1) desynchronizes them: 500
+            # retries smear across a full second instead of landing on
+            # one millisecond. AWS's architecture blog ("Exponential
+            # Backoff and Jitter") made this the industry-standard retry
+            # recipe — every AWS SDK ships it by default.
             wait_seconds = (2 ** retry_count) + random.uniform(0, 1)
             log_event(
                 "RETRY_SCHEDULED",
@@ -239,6 +255,20 @@ async def process_job(job_data: dict, pool, redis_client) -> None:
                 job_id,
                 extra=f"attempts={retry_count + 1} final_error={error_message}",
             )
+
+    finally:
+        # ------------------------------------------------------------------
+        # STEP 4: REMOVE FROM THE IN-FLIGHT LEDGER — on EVERY exit path.
+        # success -> job is done; retry -> job is back ON the queue (the
+        # queue itself now guards it, not this ledger); DLQ -> job is
+        # permanently parked. In all three cases no worker is holding it
+        # anymore. `finally` (not a call at the end of each branch)
+        # guarantees even an unexpected exception in the bookkeeping above
+        # can't leave a phantom entry that recovery would later requeue.
+        # The ONLY way a job_id survives in jobs:processing is a genuine
+        # process death — exactly the signal recover_stuck_jobs() wants.
+        # ------------------------------------------------------------------
+        await unmark_processing(redis_client, job_id)
 
 
 async def main() -> None:

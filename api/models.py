@@ -33,43 +33,21 @@ from pydantic import BaseModel, EmailStr, Field, field_validator, model_validato
 
 
 class JobType(str, Enum):
-    """
-    The only three job types Phase 1 supports.
-
-    Using a (str, Enum) instead of a plain string means:
-      - FastAPI auto-generates a dropdown of valid values in the /docs UI
-      - Pydantic rejects any job type outside this list with a clear 422
-        error, instead of the worker discovering an unknown type later
-        (fail fast, at the API boundary, not deep inside job execution).
-    """
+ 
     SEND_EMAIL = "send_email"
     PROCESS_CSV = "process_csv"
     RESIZE_IMAGE = "resize_image"
+    # Phase 2 additions:
+    IMAGE_PROCESSOR = "image_processor"
+    DATA_PIPELINE = "data_pipeline"
 
 
 class JobStatus(str, Enum):
-    """
-    The full lifecycle a job moves through, in order:
-      pending -> running -> completed
-                          -> failed (after MAX_RETRIES exhausted)
-
-    Stored as a plain VARCHAR in Postgres (not a native Postgres ENUM — see
-    migrations/001_init.sql comment on the `type` column for why), but
-    validated as an enum here at the Python/API layer.
-    """
     PENDING = "pending"
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
 
-
-# ============================================================================
-# PER-JOB-TYPE PAYLOAD SCHEMAS
-# Each job type has a different shape of `payload`. These models let us
-# validate "did the user send the right fields for THIS job type" instead
-# of accepting an arbitrary dict and discovering missing fields only when
-# the worker crashes trying to execute it.
-# ============================================================================
 
 class EmailPayload(BaseModel):
     """Payload required for a send_email job."""
@@ -79,13 +57,15 @@ class EmailPayload(BaseModel):
     subject: str = Field(..., min_length=1)
     body: str = Field(..., min_length=1)
 
+    # PHASE 2: optional HTML version of the same message. When present, the
+    # worker sends a multipart/alternative email (plain + HTML together) —
+    # modern clients render the HTML, ancient ones fall back to plain text.
+    # Optional with default None so every Phase 1 payload remains valid.
+    html_body: Optional[str] = None
+
 
 class CsvPayload(BaseModel):
-    """Payload required for a process_csv job."""
-    # Just the path to the CSV file (relative to the shared uploads/ volume
-    # mounted into both the api and worker containers). We don't validate
-    # the file actually exists here — that's the worker's job at execution
-    # time, since the file may be uploaded moments after this request.
+
     file_path: str = Field(..., min_length=1)
 
 
@@ -108,14 +88,96 @@ class ImagePayload(BaseModel):
         return sizes
 
 
+class ImageProcessorPayload(BaseModel):
+    
+    image_path: str = Field(..., min_length=1)
+
+    # Which pipeline stages to run, e.g. ["resize", "compress", "convert",
+    # "thumbnail"]. Lets a caller run a subset (thumbnail only) without a
+    # separate job type per combination.
+    operations: List[str] = Field(..., min_length=1)
+
+    # Target bounding boxes for the resize stage, e.g. [[800,600],[400,300]].
+    # Optional because a thumbnail-only job has no resize dimensions.
+    resize_dimensions: Optional[List[Tuple[int, int]]] = None
+
+    # Output format for converted images. WebP default: ~30% smaller than
+    # JPEG at equivalent visual quality (better entropy coding), supported
+    # by every modern browser.
+    convert_to: str = "webp"
+
+    # Lossy compression quality 1-100. 85 is the sweet spot used by most
+    # CDNs: visually indistinguishable from 100 at roughly half the bytes.
+    quality: int = Field(85, ge=1, le=100)
+
+    generate_thumbnail: bool = False
+    thumbnail_size: Tuple[int, int] = (150, 150)
+
+    @field_validator("operations")
+    @classmethod
+    def operations_must_be_known(cls, operations: List[str]) -> List[str]:
+        """Reject typos like 'reize' at the API boundary, not in the worker."""
+        allowed = {"resize", "compress", "convert", "thumbnail"}
+        unknown = set(operations) - allowed
+        if unknown:
+            raise ValueError(f"Unknown operations {sorted(unknown)}. Allowed: {sorted(allowed)}")
+        return operations
+
+    @field_validator("resize_dimensions")
+    @classmethod
+    def dimensions_must_be_positive(
+        cls, dims: Optional[List[Tuple[int, int]]]
+    ) -> Optional[List[Tuple[int, int]]]:
+        """Same guard as ImagePayload.sizes — no zero/negative boxes."""
+        if dims is not None:
+            for width, height in dims:
+                if width <= 0 or height <= 0:
+                    raise ValueError(f"Invalid dimensions {(width, height)}: must be positive")
+        return dims
+
+
+class DataPipelinePayload(BaseModel):
+    """
+    Payload for a Phase 2 data_pipeline job — the full ETL version of
+    process_csv: validate columns, clean (duplicates/nulls/whitespace),
+    transform, compute stats and a 0-100 quality score.
+    """
+    file_path: str = Field(..., min_length=1)
+
+    # Which ETL stages to run, e.g. ["validate", "clean", "transform", "stats"].
+    operations: List[str] = Field(..., min_length=1)
+
+    expected_columns: Optional[List[str]] = None
+
+    drop_duplicates: bool = True
+
+    # 'drop' = remove rows containing nulls; 'fill' = replace nulls with a
+    # sensible default (empty string / column mean). Payload-driven so the
+    # same handler serves both strict and lenient cleaning policies.
+    handle_nulls: str = Field("drop", pattern="^(drop|fill)$")
+
+    output_format: str = Field("csv", pattern="^(csv|json)$")
+
+    @field_validator("operations")
+    @classmethod
+    def operations_must_be_known(cls, operations: List[str]) -> List[str]:
+        allowed = {"validate", "clean", "transform", "stats"}
+        unknown = set(operations) - allowed
+        if unknown:
+            raise ValueError(f"Unknown operations {sorted(unknown)}. Allowed: {sorted(allowed)}")
+        return operations
+
+
 # Maps each JobType to the Pydantic model that validates its payload.
 # Used by JobSubmitRequest.validate_payload_matches_type below — a single
-# lookup table instead of an if/elif chain, so adding a 4th job type later
+# lookup table instead of an if/elif chain, so adding a new job type later
 # means adding one enum value + one payload class + one dict entry here.
 _PAYLOAD_SCHEMAS: dict = {
     JobType.SEND_EMAIL: EmailPayload,
     JobType.PROCESS_CSV: CsvPayload,
     JobType.RESIZE_IMAGE: ImagePayload,
+    JobType.IMAGE_PROCESSOR: ImageProcessorPayload,
+    JobType.DATA_PIPELINE: DataPipelinePayload,
 }
 
 

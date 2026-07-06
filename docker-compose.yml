@@ -177,7 +177,13 @@ services:
     # in a way a plain `python worker.py` run in a terminal is not.
     restart: unless-stopped
 
-    command: python -m worker.worker
+    # PHASE 2: worker_pool spawns WORKER_COUNT (default 3) independent
+    # worker processes inside this one container, supervises them, and
+    # runs the crash-recovery sweep at startup. Layered resilience:
+    # worker.py's try/except catches job errors -> worker_pool respawns
+    # crashed processes -> Docker restarts the whole container.
+    # (Single-worker mode is still available: python -m worker.worker)
+    command: python -m worker.worker_pool
 
 # Named volumes declared at the top level, referenced by service definitions
 # above. Docker manages the actual storage location on the host.

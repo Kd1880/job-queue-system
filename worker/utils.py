@@ -1,28 +1,3 @@
-"""
-worker/utils.py
-------------------
-PURPOSE: Shared utilities for the worker process — everything that isn't
-         "how do I execute this specific job type" lives here: connecting
-         to Postgres/Redis, and every read/write query the worker needs to
-         move a job through its lifecycle (pending -> running -> completed
-         | failed -> dead_letter_queue).
-
-WHY THIS DUPLICATES SOME OF api/database.py / api/redis_client.py:
-  The worker's Docker image (see worker/Dockerfile) only COPYs the
-  worker/ directory into the container — it never includes api/. This is
-  intentional: the api and worker are independently deployable services in
-  a real distributed system (Phase 2 will scale them to different replica
-  counts), so they must not share a Python import path. A small amount of
-  duplicated connection-setup code is the price of that independence, and
-  is far preferable to a fragile shared-package dependency between two
-  services that are supposed to be decoupled.
-
-HOW IT FITS IN THE SYSTEM:
-  worker/worker.py (the main loop) calls into this module for every
-  database read/write and every Redis interaction beyond the initial
-  BRPOP. Keeping SQL/Redis calls here (not inline in the loop) keeps the
-  main loop readable as pure orchestration logic.
-"""
 
 import json
 import os
@@ -32,21 +7,15 @@ from typing import Any, Optional
 import asyncpg
 import redis.asyncio as redis
 
-# Same env vars as api/database.py and api/redis_client.py — both read from
-# the identical .env file via docker-compose's env_file, so api and worker
-# always agree on which Postgres/Redis instance to talk to.
+
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/jobqueue"
 )
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 
-# Must match api/redis_client.py's QUEUE_KEY exactly — this is the one
-# Redis list both processes agree to use as the handoff point. If these
-# ever drifted apart, jobs pushed by the API would never be seen by the
-# worker (silently, with no error on either side) — a good reason this
-# constant, like DATABASE_URL/REDIS_URL, is worth keeping trivially easy to
-# grep for across the codebase.
 QUEUE_KEY = "jobs:queue"
+
+PROCESSING_SET_KEY = "jobs:processing"
 
 # Read from the environment so `docker-compose.yml`'s .env is the single
 # place retry behavior is tuned, without editing code.
@@ -55,47 +24,21 @@ WORKER_TIMEOUT = int(os.environ.get("WORKER_TIMEOUT", "5"))
 
 
 async def create_db_pool() -> asyncpg.Pool:
-    """
-    Create the worker's own asyncpg connection pool.
-
-    min_size/max_size are small (the worker processes ONE job at a time in
-    Phase 1 — see worker/worker.py's single `while True` loop with no
-    concurrency), so it never needs more than a couple of connections. This
-    will grow in Phase 2 when multiple worker processes/coroutines run
-    concurrently.
-    """
+   
     return await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
 
 
 def create_redis_client() -> redis.Redis:
-    """
-    Create the worker's Redis client.
-
-    decode_responses=True so BRPOP and every other Redis call returns
-    plain Python str instead of bytes — the worker immediately
-    json.loads() whatever it reads, so raw bytes would just need decoding
-    by hand first.
-    """
+   
     return redis.from_url(REDIS_URL, decode_responses=True)
 
 
 def log_event(event: str, job_id: str, extra: str = "") -> None:
-    """
-    Print a single structured lifecycle log line.
 
-    WHY PRINT (not a logging framework) in Phase 1: the worker runs as a
-    Docker container with stdout captured by `docker-compose logs -f
-    worker` — print() is instantly visible there with zero configuration.
-    A real logging framework (structured JSON logs, log levels, shipping
-    to a log aggregator) is a natural Phase 2+ upgrade once this system
-    has more than one worker to correlate logs across.
-
-    Every job lifecycle transition funnels through this one function so
-    the log format stays consistent: [TIMESTAMP] EVENT job_id=... extra
-    """
+    worker_id = os.environ.get("WORKER_ID", "worker-main")
     timestamp = datetime.now(timezone.utc).isoformat()
     suffix = f" {extra}" if extra else ""
-    print(f"[{timestamp}] {event} job_id={job_id}{suffix}", flush=True)
+    print(f"[{timestamp}] [{worker_id}] {event} job_id={job_id}{suffix}", flush=True)
 
 
 async def get_job(pool: asyncpg.Pool, job_id: str) -> Optional[asyncpg.Record]:
@@ -120,18 +63,7 @@ async def get_job(pool: asyncpg.Pool, job_id: str) -> Optional[asyncpg.Record]:
 
 
 async def update_job_running(pool: asyncpg.Pool, job_id: str) -> None:
-    """
-    Mark a job as 'running' and stamp started_at with the current time.
 
-    WHY WE WRITE THIS BEFORE EXECUTING (not after): if the worker process
-    crashed mid-execution with no 'running' checkpoint ever written, a
-    later inspection of the jobs table couldn't distinguish "never
-    started" from "started and crashed". Recording 'running' + started_at
-    up front means started_at is always an honest timestamp of when work
-    actually began, and a job stuck in 'running' for a suspiciously long
-    time is a visible signal something went wrong (a stuck-job sweep is a
-    natural Phase 2 addition).
-    """
     await pool.execute(
         "UPDATE jobs SET status = 'running', started_at = $2 WHERE id = $1",
         job_id,
@@ -259,3 +191,194 @@ async def requeue_job(redis_client: redis.Redis, job_data: dict) -> None:
     "priority" or "retry" queue to reason about in Phase 1).
     """
     await redis_client.lpush(QUEUE_KEY, json.dumps(job_data))
+
+
+# ============================================================================
+# PHASE 2: RELIABILITY PRIMITIVES
+# ============================================================================
+
+async def claim_job(pool: asyncpg.Pool, job_id: str) -> bool:
+    """
+    Atomically claim a job for THIS worker. Returns True if we won the
+    claim (and the job is now 'running'), False if someone else did (or
+    the job is already completed/failed) — in which case the caller must
+    skip it entirely.
+
+    THE RACE CONDITION THIS FIXES:
+      Phase 1's check was two separate steps:
+          1. SELECT status FROM jobs WHERE id = X   -- reads 'pending'
+          2. UPDATE jobs SET status = 'running'...
+      With 3 workers, two of them can BOTH run step 1 in the same
+      millisecond, BOTH see 'pending', and BOTH proceed to execute the
+      job — the recipient gets two emails. The read and the write must be
+      ONE indivisible operation, which is exactly what a transaction +
+      row lock provides.
+
+    HOW EACH PIECE CONTRIBUTES:
+      conn.transaction()  — BEGIN/COMMIT. The row lock acquired by the
+        SELECT below lives until COMMIT, so the status check and the
+        UPDATE happen under one continuous lock: no other worker can
+        touch the row between our read and our write.
+      FOR UPDATE — locks the selected row. Any other transaction trying
+        to lock the same row must WAIT until we commit; by then status is
+        'running' and their WHERE status='pending' no longer matches.
+      SKIP LOCKED — the crucial extra: instead of WAITING for a locked
+        row (a queue of workers stacking up behind one job, all but one
+        discovering it's taken), a competing worker gets zero rows back
+        IMMEDIATELY and moves on to its next BRPOP. Losing a claim race
+        costs microseconds instead of a blocked connection. This
+        SELECT ... FOR UPDATE SKIP LOCKED pattern is THE standard way to
+        build a job queue on Postgres.
+
+    WHY status = 'pending' IN THE WHERE CLAUSE: it makes the claim doubly
+    safe — a job that's already 'running' (claimed by a live worker),
+    'completed', or 'failed' simply doesn't match, so duplicate deliveries
+    of the same job_id through Redis become harmless no-ops. This replaces
+    Phase 1's separate read-then-check idempotency logic with one atomic
+    operation.
+    """
+    # pool.acquire(): transactions need ALL their statements on the SAME
+    # connection (a pool hands different statements to different
+    # connections otherwise, and BEGIN on one connection does nothing for
+    # a statement running on another).
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                SELECT id FROM jobs
+                WHERE id = $1 AND status = 'pending'
+                FOR UPDATE SKIP LOCKED
+                """,
+                job_id,
+            )
+            if row is None:
+                # Either another worker holds the lock right now (SKIP
+                # LOCKED returned nothing), or the job is past 'pending'.
+                # Both mean the same thing for us: not ours, don't touch.
+                return False
+
+            # We hold the row lock — nobody else can claim between the
+            # SELECT above and this UPDATE. Flip to 'running' and stamp
+            # started_at (same write Phase 1's update_job_running did,
+            # now protected by the lock).
+            await conn.execute(
+                "UPDATE jobs SET status = 'running', started_at = $2 WHERE id = $1",
+                job_id,
+                datetime.now(timezone.utc).replace(tzinfo=None),
+            )
+            return True
+        # COMMIT happens here as the transaction context exits — this is
+        # the instant the row lock releases and other workers see 'running'.
+
+
+async def mark_processing(redis_client: redis.Redis, job_id: str) -> None:
+    """
+    Record that a worker is ACTIVELY executing this job right now.
+
+    SADD = Set Add: O(1), idempotent (adding an existing member is a
+    no-op — safe even if a retry re-adds the same id). Called immediately
+    after a successful claim_job(), BEFORE execution starts.
+
+    WHY THIS EXISTS (crash recovery): BRPOP is destructive — the moment a
+    worker pops a job, it's GONE from the queue. If that worker then dies
+    (OOM-kill, docker restart, kernel panic) mid-execution, no other
+    worker will ever see the job again: it would sit in Postgres as
+    'running' forever while nothing actually runs it. This Set is the
+    worker's "I'm holding these" ledger — recover_stuck_jobs() reads it
+    on startup to find and requeue exactly those orphans.
+    """
+    await redis_client.sadd(PROCESSING_SET_KEY, job_id)
+
+
+async def unmark_processing(redis_client: redis.Redis, job_id: str) -> None:
+    """
+    Remove a job from the in-flight ledger — called on EVERY exit path
+    from execution: success, retry-requeued (it's back on the queue, no
+    longer in-flight), or moved to DLQ (permanently done). SREM = Set
+    Remove: O(1), no-op if the member is already gone.
+
+    A job_id should only ever remain in this Set if a worker died between
+    mark and unmark — which is precisely the signal recovery looks for.
+    """
+    await redis_client.srem(PROCESSING_SET_KEY, job_id)
+
+
+async def recover_stuck_jobs(pool: asyncpg.Pool, redis_client: redis.Redis) -> int:
+    """
+    Startup crash-recovery sweep: requeue jobs a dead worker left behind.
+    Returns the number of jobs recovered.
+
+    These are jobs that were being processed when a worker crashed — the
+    worker SADDed them to jobs:processing, then died before SREMing. We
+    requeue them automatically so no job is ever silently lost.
+
+    Runs ONCE, from worker_pool.py, BEFORE any workers start — running it
+    per-worker would race (3 workers requeueing the same orphan 3 times).
+
+    HOW EACH ORPHAN IS HANDLED — Postgres is the source of truth, the
+    Redis Set is only a hint, so we check the job's REAL status first:
+      'running' / 'pending'  -> genuinely orphaned. Rebuild the job dict
+          from the Postgres row (id, type, payload, retry_count — the
+          same shape the API originally pushed), reset status to
+          'pending', LPUSH it back onto the queue, SREM the ledger entry.
+      'completed' / 'failed' -> the worker crashed in the narrow window
+          AFTER finishing the job but BEFORE SREM. The work is done —
+          requeueing would redo a completed side effect (double email!).
+          Just SREM the stale entry.
+      not in Postgres at all -> Redis has an id Postgres never saw
+          (shouldn't happen; defensive). Just SREM.
+
+    AT-LEAST-ONCE, NOT EXACTLY-ONCE: if the worker died between the SMTP
+    send and update_job_completed(), the job's status is still 'running',
+    so we WILL requeue it and the email WILL go out twice. That's the
+    at-least-once delivery guarantee every real queue (SQS, RabbitMQ)
+    makes — exactly-once requires idempotent handlers, which is why
+    email_handler stamps a message_id (duplicates are detectable).
+    """
+    # SMEMBERS returns every member of the Set. Fine at this scale (the
+    # set only ever holds ~as many entries as there are workers); a system
+    # with thousands of in-flight jobs would SSCAN in batches instead.
+    stuck_ids = await redis_client.smembers(PROCESSING_SET_KEY)
+    if not stuck_ids:
+        return 0
+
+    recovered = 0
+    for job_id in stuck_ids:
+        row = await pool.fetchrow(
+            "SELECT id, user_id, type, payload, retry_count, status FROM jobs WHERE id = $1",
+            job_id,
+        )
+
+        if row is not None:
+            status = row["status"]
+            if status in ("running", "pending"):
+                # Genuine orphan: put it back in line. Reset to 'pending'
+                # FIRST (Postgres before Redis, same write-order rule the
+                # API follows) so claim_job()'s WHERE status='pending'
+                # will accept it when a worker picks it up.
+                await pool.execute(
+                    "UPDATE jobs SET status = 'pending' WHERE id = $1", job_id
+                )
+                await redis_client.lpush(
+                    QUEUE_KEY,
+                    json.dumps({
+                        "id": str(row["id"]),
+                        "user_id": row["user_id"],
+                        "type": row["type"],
+                        # payload comes back from asyncpg as a JSON string
+                        # (no jsonb codec registered — see api/routes/jobs.py
+                        # for the same tradeoff) — decode before re-nesting,
+                        # or the worker would receive a string, not a dict.
+                        "payload": json.loads(row["payload"]),
+                        "retry_count": row["retry_count"] or 0,
+                    }),
+                )
+                log_event("RECOVERED_STUCK_JOB", job_id, extra=f"was={status}, requeued")
+                recovered += 1
+            else:
+                log_event("STALE_PROCESSING_ENTRY", job_id, extra=f"status={status}, dropped")
+
+        # In every branch the ledger entry itself is now handled.
+        await redis_client.srem(PROCESSING_SET_KEY, job_id)
+
+    return recovered

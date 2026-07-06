@@ -29,6 +29,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from api.database import close_pool, create_pool
+from api.middleware.rate_limiter import RateLimitExceeded
 from api.redis_client import close_redis_client, create_redis_client
 from api.routes import admin, jobs
 
@@ -100,6 +101,30 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
     return JSONResponse(
         status_code=422,
         content={"error": "Validation failed", "detail": detail},
+    )
+
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+    """
+    PHASE 2: Converts a RateLimitExceeded (raised by the check_rate_limit
+    dependency on POST /jobs) into the documented 429 response.
+
+    429 = "Too Many Requests", the standard rate-limiting status code.
+    The Retry-After header is the machine-readable version of the same
+    hint as the retry_after body field — standard HTTP clients (and
+    well-behaved SDK retry policies) honor the header automatically,
+    while humans reading JSON in a console see the body field.
+    """
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": "Rate limit exceeded",
+            "limit": exc.limit,
+            "window": "1 minute",
+            "retry_after": exc.retry_after,
+        },
+        headers={"Retry-After": str(exc.retry_after)},
     )
 
 
