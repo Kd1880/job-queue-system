@@ -198,45 +198,7 @@ async def requeue_job(redis_client: redis.Redis, job_data: dict) -> None:
 # ============================================================================
 
 async def claim_job(pool: asyncpg.Pool, job_id: str) -> bool:
-    """
-    Atomically claim a job for THIS worker. Returns True if we won the
-    claim (and the job is now 'running'), False if someone else did (or
-    the job is already completed/failed) — in which case the caller must
-    skip it entirely.
-
-    THE RACE CONDITION THIS FIXES:
-      Phase 1's check was two separate steps:
-          1. SELECT status FROM jobs WHERE id = X   -- reads 'pending'
-          2. UPDATE jobs SET status = 'running'...
-      With 3 workers, two of them can BOTH run step 1 in the same
-      millisecond, BOTH see 'pending', and BOTH proceed to execute the
-      job — the recipient gets two emails. The read and the write must be
-      ONE indivisible operation, which is exactly what a transaction +
-      row lock provides.
-
-    HOW EACH PIECE CONTRIBUTES:
-      conn.transaction()  — BEGIN/COMMIT. The row lock acquired by the
-        SELECT below lives until COMMIT, so the status check and the
-        UPDATE happen under one continuous lock: no other worker can
-        touch the row between our read and our write.
-      FOR UPDATE — locks the selected row. Any other transaction trying
-        to lock the same row must WAIT until we commit; by then status is
-        'running' and their WHERE status='pending' no longer matches.
-      SKIP LOCKED — the crucial extra: instead of WAITING for a locked
-        row (a queue of workers stacking up behind one job, all but one
-        discovering it's taken), a competing worker gets zero rows back
-        IMMEDIATELY and moves on to its next BRPOP. Losing a claim race
-        costs microseconds instead of a blocked connection. This
-        SELECT ... FOR UPDATE SKIP LOCKED pattern is THE standard way to
-        build a job queue on Postgres.
-
-    WHY status = 'pending' IN THE WHERE CLAUSE: it makes the claim doubly
-    safe — a job that's already 'running' (claimed by a live worker),
-    'completed', or 'failed' simply doesn't match, so duplicate deliveries
-    of the same job_id through Redis become harmless no-ops. This replaces
-    Phase 1's separate read-then-check idempotency logic with one atomic
-    operation.
-    """
+   
     # pool.acquire(): transactions need ALL their statements on the SAME
     # connection (a pool hands different statements to different
     # connections otherwise, and BEGIN on one connection does nothing for
@@ -382,3 +344,35 @@ async def recover_stuck_jobs(pool: asyncpg.Pool, redis_client: redis.Redis) -> i
         await redis_client.srem(PROCESSING_SET_KEY, job_id)
 
     return recovered
+# ============================================================================
+# PHASE 3: REAL-TIME STATUS BROADCASTING
+# ============================================================================
+
+
+STATUS_CHANNEL = "jobs:updates"
+
+
+async def publish_status(
+    redis_client: redis.Redis,
+    job_id: str,
+    user_id: str,
+    status: str,
+    job_type: str,
+    result: Optional[dict] = None,
+    error: Optional[str] = None,
+    retry_count: int = 0,
+) -> None:
+    
+    message = {
+        "job_id": job_id,
+        "user_id": user_id,
+        "type": job_type,
+        "status": status,
+        "result": result,
+        "error": error,
+        "retry_count": retry_count,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    await redis_client.publish(STATUS_CHANNEL,json.dumps(message))
+

@@ -21,10 +21,10 @@ STARTUP/SHUTDOWN LIFECYCLE:
   On shutdown: close both cleanly so Postgres/Redis see graceful
   disconnects instead of the app just vanishing.
 """
-
+import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -32,6 +32,7 @@ from api.database import close_pool, create_pool
 from api.middleware.rate_limiter import RateLimitExceeded
 from api.redis_client import close_redis_client, create_redis_client
 from api.routes import admin, jobs
+from api.websocket_manager import manager 
 
 
 @asynccontextmanager
@@ -51,8 +52,12 @@ async def lifespan(app: FastAPI):
     # latency on every single API call.
     app.state.db_pool = await create_pool()
     app.state.redis_client = create_redis_client()
+    app.state.pubsub_task=asyncio.create_task(
+        manager.subscribe_to_redis(app.state.redis_client)
+    )
 
     yield  # <-- the app serves requests here
+    app.state.pubsub_task.cancel()
 
     # SHUTDOWN: close both cleanly so Postgres/Redis see a graceful
     # disconnect (freeing their server-side resources immediately) instead
@@ -162,3 +167,13 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 async def root() -> dict:
     """Trivial liveness check — lets you confirm the container is up with `curl localhost:8000/`."""
     return {"service": "job-queue-api", "status": "ok"}
+
+@app.websocket("/ws/{user_id}")
+async def websocket_endpoint(websocket:WebSocket, user_id:str):
+    await manager.connect(websocket, user_id)
+
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, user_id)
