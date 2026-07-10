@@ -281,6 +281,11 @@ class AdminStatsResponse(BaseModel):
     # Count of jobs created within the last 60 minutes — a rough
     # throughput/activity indicator.
     jobs_last_hour: int
+    # Number of jobs being executed by workers RIGHT NOW — the live size
+    # of the Redis "jobs:processing" set (Phase 2's crash-recovery ledger,
+    # reused here as a busy-ness signal). 0 = all workers idle.
+    active_jobs: int
+
 
 
 class ErrorResponse(BaseModel):
